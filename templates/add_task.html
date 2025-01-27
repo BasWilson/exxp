@@ -1,15 +1,21 @@
 {{ define "add_task.html" }}
-<form hx-post="/add-task" hx-target="#app" hx-swap="outerHTML" class="space-y-3">
+<form hx-post="/add-task/{{ .SessionID }}" hx-target="#app" hx-swap="outerHTML" class="space-y-3">
     <div class="space-y-2">
         <div class="flex items-center space-x-2">
             <input
                 type="text"
                 name="name"
                 placeholder="Task name"
-                class="border rounded px-2 py-1 text-gray-700 flex-grow"
+                class="border rounded px-2 py-1 text-gray-700 dark:text-gray-200 flex-grow"
                 required
             />
-            <input type="number" name="xp" placeholder="XP value" class="border rounded px-2 py-1 text-gray-700 w-24" required />
+            <input
+                type="number"
+                name="xp"
+                placeholder="XP value"
+                class="border rounded px-2 py-1 text-gray-700 dark:text-gray-200 w-24"
+                required
+            />
         </div>
     </div>
     <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Add Task</button>

@@ -1,5 +1,5 @@
 {{ define "unlockables.html" }}
-<form hx-post="/add-unlockable" hx-target="#app" hx-swap="outerHTML" class="space-y-3">
+<form hx-post="/add-unlockable/{{ .SessionID }}" hx-target="#app" hx-swap="outerHTML" class="space-y-3">
     <div class="space-y-2">
         <div class="flex items-center space-x-2">
             <input

@@ -2,7 +2,7 @@
 <div class="space-y-3">
     {{ range $index, $task := .Tasks }} {{ if not $task.Completed }}
     <form
-        hx-post="/add-xp"
+        hx-post="/add-xp/{{ .SessionID }}"
         hx-target="#app"
         hx-swap="outerHTML"
         class="flex items-center justify-between pl-3 bg-gray-100 dark:bg-gray-700 rounded"

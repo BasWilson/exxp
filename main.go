@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,16 +21,26 @@ import (
 var templatesFS embed.FS
 
 type Task struct {
-	ID        int
+	ID        string
 	Name      string
 	XP        int
 	Completed bool
 }
 
 type Unlockable struct {
-	ID          int
+	ID          string
 	Level       int
 	Description string
+}
+
+type templateData struct {
+	SessionID    string
+	Tasks        []Task
+	Unlockables  []Unlockable
+	TotalXP      int
+	CurrentLevel int
+	Progress     float64
+	Unlocked     map[int]bool
 }
 
 // Configuration struct
@@ -41,6 +53,12 @@ type Config struct {
 // Database tables structure
 const (
 	createTablesSQL = `
+	CREATE TABLE IF NOT EXISTS sessions (
+		id VARCHAR(255) PRIMARY KEY,
+		total_xp INTEGER NOT NULL DEFAULT 0,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS app_state (
 		id INTEGER PRIMARY KEY,
 		total_xp INTEGER NOT NULL DEFAULT 0,
@@ -52,7 +70,8 @@ const (
 		name VARCHAR(255) NOT NULL,
 		xp INTEGER NOT NULL CHECK (xp > 0),
 		completed BOOLEAN NOT NULL DEFAULT false,
-		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		session_id VARCHAR(255) REFERENCES sessions(id)
 	);
 
 	CREATE TABLE IF NOT EXISTS unlockables (
@@ -60,13 +79,15 @@ const (
 		level INTEGER NOT NULL CHECK (level >= 0),
 		description TEXT NOT NULL,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		session_id VARCHAR(255) REFERENCES sessions(id),
 		UNIQUE (level, description)
 	);
 
 	CREATE TABLE IF NOT EXISTS unlocked_levels (
 		level INTEGER PRIMARY KEY,
 		unlocked BOOLEAN NOT NULL DEFAULT true,
-		unlocked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+		unlocked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		session_id VARCHAR(255) REFERENCES sessions(id)
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
@@ -74,11 +95,23 @@ const (
 )
 
 type AppState struct {
-	sync.RWMutex // Using RWMutex for better concurrent access
-	db           *sql.DB
-	TotalXP      int
-	Unlocked     map[int]bool
-	stmts        map[string]*sql.Stmt
+	sync.RWMutex
+	db        *sql.DB
+	SessionID string
+	TotalXP   int
+	Unlocked  map[int]bool
+	stmts     map[string]*sql.Stmt
+}
+
+var templates *template.Template
+
+func init() {
+	godotenv.Load()
+	templates = template.Must(template.New("").Funcs(template.FuncMap{
+		"add": func(a, b int) int { return a + b },
+		"sub": func(a, b int) int { return a - b },
+		"mod": func(a, b int) int { return a % b },
+	}).ParseGlob("templates/*.html"))
 }
 
 // Initialize database connection
@@ -102,21 +135,28 @@ func initDB(config Config) (*sql.DB, error) {
 }
 
 // Replace loadState with initAppState
-func initAppState(db *sql.DB) (*AppState, error) {
+func initAppState(db *sql.DB, sessionID string) (*AppState, error) {
 	state := &AppState{
-		db:       db,
-		Unlocked: make(map[int]bool),
-		stmts:    make(map[string]*sql.Stmt),
+		db:        db,
+		SessionID: sessionID,
+		Unlocked:  make(map[int]bool),
+		stmts:     make(map[string]*sql.Stmt),
+	}
+
+	// First ensure the session exists
+	_, err := db.Exec("INSERT INTO sessions (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("error ensuring session exists: %w", err)
 	}
 
 	// Prepare statements
 	statements := map[string]string{
-		"getTasks":        "SELECT id, name, xp, completed FROM tasks",
-		"getUnlockables": "SELECT id, level, description FROM unlockables",
-		"addTask":        "INSERT INTO tasks (name, xp, completed) VALUES ($1, $2, false)",
-		"completeTask":   "UPDATE tasks SET completed = true WHERE id = $1 AND completed = false RETURNING xp",
-		"updateXP":       "UPDATE app_state SET total_xp = $1 WHERE id = 1",
-		"addUnlockable":  "INSERT INTO unlockables (level, description) VALUES ($1, $2)",
+		"getTasks":        "SELECT id, name, xp, completed FROM tasks WHERE session_id = $1",
+		"getUnlockables": "SELECT id, level, description FROM unlockables WHERE session_id = $1 ORDER BY level",
+		"addTask":        "INSERT INTO tasks (name, xp, completed, session_id) VALUES ($1, $2, false, $3)",
+		"completeTask":   "UPDATE tasks SET completed = true WHERE id = $1 AND session_id = $2 AND completed = false RETURNING xp",
+		"updateXP":       "UPDATE sessions SET total_xp = $1 WHERE id = $2",
+		"addUnlockable":  "INSERT INTO unlockables (level, description, session_id) VALUES ($1, $2, $3)",
 	}
 
 	for name, query := range statements {
@@ -128,13 +168,9 @@ func initAppState(db *sql.DB) (*AppState, error) {
 	}
 
 	// Initialize state
-	err := db.QueryRow("SELECT total_xp FROM app_state WHERE id = 1").Scan(&state.TotalXP)
-	if err == sql.ErrNoRows {
-		if _, err := db.Exec("INSERT INTO app_state (id, total_xp) VALUES (1, 0)"); err != nil {
-			return nil, fmt.Errorf("error initializing app_state: %w", err)
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("error loading total XP: %w", err)
+	err = db.QueryRow("SELECT total_xp FROM sessions WHERE id = $1", sessionID).Scan(&state.TotalXP)
+	if err != nil {
+		return nil, fmt.Errorf("error loading session state: %w", err)
 	}
 
 	// Load unlocked levels
@@ -146,7 +182,7 @@ func initAppState(db *sql.DB) (*AppState, error) {
 }
 
 func (a *AppState) loadUnlockedLevels() error {
-	rows, err := a.db.Query("SELECT level FROM unlocked_levels WHERE unlocked = true")
+	rows, err := a.db.Query("SELECT level FROM unlocked_levels WHERE session_id = $1 AND unlocked = true", a.SessionID)
 	if err != nil {
 		return fmt.Errorf("error loading unlocked levels: %w", err)
 	}
@@ -164,7 +200,7 @@ func (a *AppState) loadUnlockedLevels() error {
 
 // Use prepared statements and caching for frequently accessed methods
 func (a *AppState) getTasks() ([]Task, error) {
-	rows, err := a.stmts["getTasks"].Query()
+	rows, err := a.stmts["getTasks"].Query(a.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting tasks: %w", err)
 	}
@@ -182,7 +218,7 @@ func (a *AppState) getTasks() ([]Task, error) {
 }
 
 func (a *AppState) getUnlockables() ([]Unlockable, error) {
-	rows, err := a.db.Query("SELECT id, level, description FROM unlockables")
+	rows, err := a.stmts["getUnlockables"].Query(a.SessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -199,11 +235,17 @@ func (a *AppState) getUnlockables() ([]Unlockable, error) {
 	return unlockables, nil
 }
 
-func main() {
+// Add this function to generate random session IDs
+func generateSessionID() string {
+	const letters = "abcdefghijklmnopqrstuvwxyz"
+	b := strings.Builder{}
+	for i := 0; i < 4; i++ {
+		b.WriteByte(letters[rand.Intn(len(letters))])
+	}
+	return b.String()
+}
 
-	// load env
-	godotenv.Load()
-	
+func main() {
 	db, err := initDB(Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		ServerPort:  ":8080",
@@ -214,245 +256,195 @@ func main() {
 	}
 	defer db.Close()
 
-	state, err := initAppState(db)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	funcMap := template.FuncMap{
-		"add": func(a, b int) int {
-			return a + b
-		},
-		"sub": func(a, b int) int {
-			return a - b
-		},
-		"mod": func(a, b int) int {
-			return a % b
-		},
-	}
-
-	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(templatesFS, "templates/*.html"))
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		state.Lock()
-		defer state.Unlock()
+		sessionID := strings.TrimPrefix(r.URL.Path, "/")
 		
-		tasks, err := state.getTasks()
-		if err != nil {
+		if sessionID == "" {
+			newSessionID := generateSessionID()
+			http.Redirect(w, r, "/"+newSessionID, http.StatusFound)
+			return
+		}
+
+		if err := initSession(db, sessionID); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		
-		unlockables, err := state.getUnlockables()
+
+		state, err := initAppState(db, sessionID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		currentLevel := state.TotalXP / 1000
-		err = tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{
-			"TotalXP":     state.TotalXP,
-			"CurrentLevel": currentLevel,
-			"Tasks":       tasks,
-			"Unlockables": unlockables,
-			"Unlocked":    state.Unlocked,
-			"Progress":    state.GetProgressPercentage(),
-		})
-		if err != nil {
+		if err := state.loadSessionXP(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+
+		state.renderAppState(w, false)
 	})
 
-	http.HandleFunc("/add-task", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		state.Lock()
-		defer state.Unlock()
-
-		name := r.FormValue("name")
-		var xp int
-		fmt.Sscanf(r.FormValue("xp"), "%d", &xp)
-
-		if name == "" || xp <= 0 {
-			http.Error(w, "Invalid input", http.StatusBadRequest)
-			return
-		}
-
-		// Use prepared statement
-		_, err := state.stmts["addTask"].Exec(name, xp)
+	http.HandleFunc("/add-task/", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := strings.TrimPrefix(r.URL.Path, "/add-task/")
+		state, err := initAppState(db, sessionID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		
-		tasks, err := state.getTasks()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		
-		unlockables, err := state.getUnlockables()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		currentLevel := state.TotalXP / 1000
-		err = tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
-			"TotalXP":     state.TotalXP,
-			"CurrentLevel": currentLevel,
-			"Tasks":       tasks,
-			"Unlockables": unlockables,
-			"Unlocked":    state.Unlocked,
-			"Progress":    state.GetProgressPercentage(),
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		state.handleAddTask(w, r)
 	})
 
-	http.HandleFunc("/add-xp", func(w http.ResponseWriter, r *http.Request) {
-		state.Lock()
-		defer state.Unlock()
-
-		taskID := r.FormValue("task")
-		
-		// Start transaction
-		tx, err := state.db.Begin()
+	http.HandleFunc("/add-xp/", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := strings.TrimPrefix(r.URL.Path, "/add-xp/")
+		state, err := initAppState(db, sessionID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer tx.Rollback()
-
-		// Get task XP and mark as completed
-		var xp int
-		err = tx.QueryRow("UPDATE tasks SET completed = true WHERE id = $1 AND completed = false RETURNING xp", taskID).Scan(&xp)
-		if err == sql.ErrNoRows {
-			http.Error(w, "Task already completed or not found", http.StatusBadRequest)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		previousLevel := state.TotalXP / 1000
-		state.TotalXP += xp
-		newLevel := state.TotalXP / 1000
-
-		// Update total XP
-		_, err = tx.Exec("UPDATE app_state SET total_xp = $1 WHERE id = 1", state.TotalXP)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Handle level-ups
-		if newLevel > previousLevel {
-			for level := previousLevel + 1; level <= newLevel; level++ {
-				_, err = tx.Exec("INSERT INTO unlocked_levels (level, unlocked) VALUES ($1, true)", level)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				state.Unlocked[level] = true
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		currentLevel := state.TotalXP / 1000
-		tasks, err := state.getTasks()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		unlockables, err := state.getUnlockables()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		err = tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
-			"TotalXP":     state.TotalXP,
-			"CurrentLevel": currentLevel,
-			"Tasks":       tasks,
-			"Unlockables": unlockables,
-			"Unlocked":    state.Unlocked,
-			"Progress":    state.GetProgressPercentage(),
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		state.handleAddXP(w, r)
 	})
 
-	// Add new endpoint for creating unlockables
-	http.HandleFunc("/add-unlockable", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		state.Lock()
-		defer state.Unlock()
-
-		var level int
-		fmt.Sscanf(r.FormValue("level"), "%d", &level)
-		description := r.FormValue("description")
-
-		if description == "" {
-			http.Error(w, "Description is required", http.StatusBadRequest)
-			return
-		}
-
-		if level < 0 {
-			http.Error(w, "Level must be positive", http.StatusBadRequest)
-			return
-		}
-
-		_, err := state.db.Exec("INSERT INTO unlockables (level, description) VALUES ($1, $2)", level, description)
+	http.HandleFunc("/add-unlockable/", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := strings.TrimPrefix(r.URL.Path, "/add-unlockable/")
+		state, err := initAppState(db, sessionID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		// Replace the comment with actual rendering
-		tasks, err := state.getTasks()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		
-		unlockables, err := state.getUnlockables()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		currentLevel := state.TotalXP / 1000
-		err = tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{
-			"TotalXP":     state.TotalXP,
-			"CurrentLevel": currentLevel,
-			"Tasks":       tasks,
-			"Unlockables": unlockables,
-			"Unlocked":    state.Unlocked,
-			"Progress":    state.GetProgressPercentage(),
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		state.handleAddUnlockable(w, r)
 	})
 
-	http.ListenAndServe(":8080", nil)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("Server starting on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func (a *AppState) GetProgressPercentage() int {
 	currentLevelXP := a.TotalXP % 1000
 	return int(float64(currentLevelXP) / 1000 * 100)
+}
+
+func initSession(db *sql.DB, sessionID string) error {
+	_, err := db.Exec("INSERT INTO sessions (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", sessionID)
+	return err
+}
+
+func (s *AppState) loadSessionXP() error {
+	return s.db.QueryRow("SELECT total_xp FROM sessions WHERE id = $1", s.SessionID).Scan(&s.TotalXP)
+}
+
+func (s *AppState) handleAddTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := r.FormValue("name")
+	xp := r.FormValue("xp")
+	
+	_, err := s.stmts["addTask"].Exec(name, xp, s.SessionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.renderAppState(w, true)
+}
+
+func (s *AppState) handleAddXP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	taskID := r.FormValue("task")
+	
+	tx, err := s.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	var xp int
+	err = tx.QueryRow("UPDATE tasks SET completed = true WHERE id = $1 AND session_id = $2 AND completed = false RETURNING xp",
+		taskID, s.SessionID).Scan(&xp)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Task already completed or not found", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.TotalXP += xp
+
+	_, err = tx.Exec("UPDATE sessions SET total_xp = $1 WHERE id = $2", s.TotalXP, s.SessionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.renderAppState(w, true)
+}
+
+func (s *AppState) handleAddUnlockable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	level := r.FormValue("level")
+	description := r.FormValue("description")
+	
+	_, err := s.stmts["addUnlockable"].Exec(level, description, s.SessionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.renderAppState(w, true)
+}
+
+func (s *AppState) renderAppState(w http.ResponseWriter, onlyApp bool) {
+	tasks, err := s.getTasks()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	unlockables, err := s.getUnlockables()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data := templateData{
+		SessionID:    s.SessionID,
+		Tasks:        tasks,
+		Unlockables:  unlockables,
+		TotalXP:      s.TotalXP,
+		CurrentLevel: s.TotalXP / 1000,
+		Progress:     float64(s.TotalXP%1000) / 10.0,
+		Unlocked:     s.Unlocked,
+	}
+	
+	file := "index.html"
+	if onlyApp {
+		file = "app.html"
+	}
+
+	if err := templates.ExecuteTemplate(w, file, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
