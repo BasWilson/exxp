@@ -1,0 +1,34 @@
+{
+    "totalXP": 0,
+    "unlockables": [
+        {
+            "Level": 1,
+            "Description": "Basic features"
+        },
+        {
+            "Level": 3,
+            "Description": "Intermediate features"
+        },
+        {
+            "Level": 5,
+            "Description": "Advanced features"
+        },
+        {
+            "Level": 10,
+            "Description": "Work on another app"
+        }
+    ],
+    "unlocked": {},
+    "tasks": [
+        {
+            "Name": "Create user authentication",
+            "XP": 500,
+            "Completed": false
+        },
+        {
+            "Name": "Setup hosting for app",
+            "XP": 1500,
+            "Completed": false
+        }
+    ]
+}

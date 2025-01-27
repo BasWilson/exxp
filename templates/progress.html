@@ -1,0 +1,15 @@
+{{ define "progress.html" }}
+<div class="mb-6">
+    <div class="flex justify-between mb-2">
+        <span class="text-lg font-semibold">Level {{ .CurrentLevel }}</span>
+        <span class="text-lg font-semibold">{{ .TotalXP }} XP</span>
+    </div>
+    <div class="w-full bg-gray-200 rounded-full h-4">
+        <div class="bg-blue-500 rounded-full h-4 transition-all duration-300" style="width: {{ .Progress }}%"></div>
+    </div>
+    <div class="mt-2 text-sm text-gray-500">
+        {{$nextLevelXP := add .TotalXP (sub 1000 (mod .TotalXP 1000))}}{{$neededXP := sub $nextLevelXP .TotalXP}}{{$neededXP}} XP
+        needed for level {{add .CurrentLevel 1}}
+    </div>
+</div>
+{{ end }}

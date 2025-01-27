@@ -1,0 +1,78 @@
+{{ define "app.html" }}
+<body id="app" class="bg-gray-100 min-h-screen p-8">
+    <div class="max-w-2xl mx-auto">
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h1 class="text-2xl font-bold mb-4">XP Tracker 📈</h1>
+
+            <div id="progress-section">{{ template "progress.html" . }}</div>
+
+            <div class="mt-6">
+                <h2 class="text-xl font-semibold mb-3">Tasks 📝</h2>
+                {{ template "tasks.html" . }}
+            </div>
+
+            <div class="mt-8">
+                <h2 class="text-xl font-semibold mb-3">Unlockables 🏆</h2>
+                <div class="space-y-2">
+                    {{ range .Unlockables }}
+                    <div
+                        class="flex items-center p-3 bg-gray-50 rounded {{ if index $.Unlocked .Level }}bg-green-50 border border-green-200{{ end }}"
+                    >
+                        <span
+                            class="text-sm font-medium {{ if index $.Unlocked .Level }}text-green-600{{ else }}text-gray-600{{ end }}"
+                        >
+                            Level {{ .Level }}: {{ .Description }}
+                        </span>
+                    </div>
+                    {{ end }}
+                </div>
+            </div>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex gap-4 justify-center mb-6">
+            <button
+                onclick="document.getElementById('unlockable-dialog').showModal()"
+                class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg"
+            >
+                Add Unlockable 🏆
+            </button>
+            <button
+                onclick="document.getElementById('task-dialog').showModal()"
+                class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg"
+            >
+                Add Task 📝
+            </button>
+        </div>
+
+        <!-- Unlockable dialog -->
+        <dialog id="unlockable-dialog" class="rounded-lg shadow-xl p-0">
+            <div class="bg-white p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-semibold">Add Unlockable 🏆</h2>
+                    <button
+                        onclick="document.getElementById('unlockable-dialog').close()"
+                        class="text-gray-500 hover:text-gray-700"
+                    >
+                        ✕
+                    </button>
+                </div>
+                {{ template "unlockables.html" . }}
+            </div>
+        </dialog>
+
+        <!-- Task dialog -->
+        <dialog id="task-dialog" class="rounded-lg shadow-xl p-0">
+            <div class="bg-white p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-semibold">Add Task 📝</h2>
+                    <button onclick="document.getElementById('task-dialog').close()" class="text-gray-500 hover:text-gray-700">
+                        ✕
+                    </button>
+                </div>
+                {{ template "add_task.html" . }}
+            </div>
+        </dialog>
+    </div>
+</body>
+{{ end }}
