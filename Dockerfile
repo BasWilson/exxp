@@ -2,7 +2,7 @@ ARG GO_VERSION=1
 FROM golang:${GO_VERSION}-bookworm as builder
 
 WORKDIR /usr/src/app
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download && go mod verify
 COPY . .
 RUN go build -v -o /run-app .

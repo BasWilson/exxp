@@ -1,76 +1,220 @@
 package main
 
 import (
+	"database/sql"
 	"embed"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"sync"
+	"time"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 //go:embed templates/*
 var templatesFS embed.FS
 
 type Task struct {
-	Name      string `json:"Name"`
-	XP        int    `json:"XP"`
-	Completed bool   `json:"Completed"`
+	ID        int
+	Name      string
+	XP        int
+	Completed bool
 }
 
 type Unlockable struct {
+	ID          int
 	Level       int
 	Description string
 }
 
-type AppState struct {
-	sync.Mutex
-	filename      string        // Add filename field
-	TotalXP      int          `json:"totalXP"`
-	Unlockables  []Unlockable `json:"unlockables"`
-	Unlocked     map[int]bool `json:"unlocked"`
-	Tasks        []Task       `json:"tasks"`
+// Configuration struct
+type Config struct {
+	DatabaseURL string
+	ServerPort  string
+	MaxDBConns  int
 }
 
-// Add methods to load and save state
-func loadState(filename string) (*AppState, error) {
-	state := &AppState{filename: filename}
-	data, err := os.ReadFile(filename)
+// Database tables structure
+const (
+	createTablesSQL = `
+	CREATE TABLE IF NOT EXISTS app_state (
+		id INTEGER PRIMARY KEY,
+		total_xp INTEGER NOT NULL DEFAULT 0,
+		CHECK (id = 1)
+	);
+
+	CREATE TABLE IF NOT EXISTS tasks (
+		id SERIAL PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		xp INTEGER NOT NULL CHECK (xp > 0),
+		completed BOOLEAN NOT NULL DEFAULT false,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS unlockables (
+		id SERIAL PRIMARY KEY,
+		level INTEGER NOT NULL CHECK (level >= 0),
+		description TEXT NOT NULL,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE (level, description)
+	);
+
+	CREATE TABLE IF NOT EXISTS unlocked_levels (
+		level INTEGER PRIMARY KEY,
+		unlocked BOOLEAN NOT NULL DEFAULT true,
+		unlocked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
+	CREATE INDEX IF NOT EXISTS idx_unlockables_level ON unlockables(level);`
+)
+
+type AppState struct {
+	sync.RWMutex // Using RWMutex for better concurrent access
+	db           *sql.DB
+	TotalXP      int
+	Unlocked     map[int]bool
+	stmts        map[string]*sql.Stmt
+}
+
+// Initialize database connection
+func initDB(config Config) (*sql.DB, error) {
+	db, err := sql.Open("postgres", config.DatabaseURL)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Initialize with empty slices and maps if file doesn't exist
-			state.Unlockables = []Unlockable{}
-			state.Unlocked = make(map[int]bool)
-			state.Tasks = []Task{}
-			return state, state.save()
+		return nil, fmt.Errorf("error opening database: %w", err)
+	}
+
+	// Set connection pool parameters
+	db.SetMaxOpenConns(config.MaxDBConns)
+	db.SetMaxIdleConns(config.MaxDBConns / 2)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Initialize tables
+	if _, err := db.Exec(createTablesSQL); err != nil {
+		return nil, fmt.Errorf("error creating tables: %w", err)
+	}
+
+	return db, nil
+}
+
+// Replace loadState with initAppState
+func initAppState(db *sql.DB) (*AppState, error) {
+	state := &AppState{
+		db:       db,
+		Unlocked: make(map[int]bool),
+		stmts:    make(map[string]*sql.Stmt),
+	}
+
+	// Prepare statements
+	statements := map[string]string{
+		"getTasks":        "SELECT id, name, xp, completed FROM tasks",
+		"getUnlockables": "SELECT id, level, description FROM unlockables",
+		"addTask":        "INSERT INTO tasks (name, xp, completed) VALUES ($1, $2, false)",
+		"completeTask":   "UPDATE tasks SET completed = true WHERE id = $1 AND completed = false RETURNING xp",
+		"updateXP":       "UPDATE app_state SET total_xp = $1 WHERE id = 1",
+		"addUnlockable":  "INSERT INTO unlockables (level, description) VALUES ($1, $2)",
+	}
+
+	for name, query := range statements {
+		stmt, err := db.Prepare(query)
+		if err != nil {
+			return nil, fmt.Errorf("error preparing statement %s: %w", name, err)
 		}
-		return nil, err
+		state.stmts[name] = stmt
 	}
 
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
+	// Initialize state
+	err := db.QueryRow("SELECT total_xp FROM app_state WHERE id = 1").Scan(&state.TotalXP)
+	if err == sql.ErrNoRows {
+		if _, err := db.Exec("INSERT INTO app_state (id, total_xp) VALUES (1, 0)"); err != nil {
+			return nil, fmt.Errorf("error initializing app_state: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("error loading total XP: %w", err)
 	}
 
-	// Initialize maps if they're nil
-	if state.Unlocked == nil {
-		state.Unlocked = make(map[int]bool)
+	// Load unlocked levels
+	if err := state.loadUnlockedLevels(); err != nil {
+		return nil, err
 	}
 
 	return state, nil
 }
 
-func (a *AppState) save() error {
-	data, err := json.MarshalIndent(a, "", "  ")
+func (a *AppState) loadUnlockedLevels() error {
+	rows, err := a.db.Query("SELECT level FROM unlocked_levels WHERE unlocked = true")
 	if err != nil {
-		return err
+		return fmt.Errorf("error loading unlocked levels: %w", err)
 	}
-	return os.WriteFile(a.filename, data, 0644)
+	defer rows.Close()
+
+	for rows.Next() {
+		var level int
+		if err := rows.Scan(&level); err != nil {
+			return fmt.Errorf("error scanning unlocked level: %w", err)
+		}
+		a.Unlocked[level] = true
+	}
+	return nil
+}
+
+// Use prepared statements and caching for frequently accessed methods
+func (a *AppState) getTasks() ([]Task, error) {
+	rows, err := a.stmts["getTasks"].Query()
+	if err != nil {
+		return nil, fmt.Errorf("error getting tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []Task
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Name, &t.XP, &t.Completed); err != nil {
+			return nil, fmt.Errorf("error scanning task: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
+
+func (a *AppState) getUnlockables() ([]Unlockable, error) {
+	rows, err := a.db.Query("SELECT id, level, description FROM unlockables")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var unlockables []Unlockable
+	for rows.Next() {
+		var u Unlockable
+		if err := rows.Scan(&u.ID, &u.Level, &u.Description); err != nil {
+			return nil, err
+		}
+		unlockables = append(unlockables, u)
+	}
+	return unlockables, nil
 }
 
 func main() {
-	state, err := loadState("appstate.json")
+
+	// load env
+	godotenv.Load()
+	
+	db, err := initDB(Config{
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		ServerPort:  ":8080",
+		MaxDBConns:  10,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	state, err := initAppState(db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -92,17 +236,80 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		state.Lock()
 		defer state.Unlock()
+		
+		tasks, err := state.getTasks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		
+		unlockables, err := state.getUnlockables()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		currentLevel := state.TotalXP / 1000
-		err := tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{
+		err = tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{
 			"TotalXP":     state.TotalXP,
 			"CurrentLevel": currentLevel,
-			"Tasks":       state.Tasks,
-			"Unlockables": state.Unlockables,
+			"Tasks":       tasks,
+			"Unlockables": unlockables,
 			"Unlocked":    state.Unlocked,
 			"Progress":    state.GetProgressPercentage(),
 		})
 		if err != nil {
-			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+
+	http.HandleFunc("/add-task", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		state.Lock()
+		defer state.Unlock()
+
+		name := r.FormValue("name")
+		var xp int
+		fmt.Sscanf(r.FormValue("xp"), "%d", &xp)
+
+		if name == "" || xp <= 0 {
+			http.Error(w, "Invalid input", http.StatusBadRequest)
+			return
+		}
+
+		// Use prepared statement
+		_, err := state.stmts["addTask"].Exec(name, xp)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		
+		tasks, err := state.getTasks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		
+		unlockables, err := state.getUnlockables()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		currentLevel := state.TotalXP / 1000
+		err = tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
+			"TotalXP":     state.TotalXP,
+			"CurrentLevel": currentLevel,
+			"Tasks":       tasks,
+			"Unlockables": unlockables,
+			"Unlocked":    state.Unlocked,
+			"Progress":    state.GetProgressPercentage(),
+		})
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
@@ -110,55 +317,79 @@ func main() {
 	http.HandleFunc("/add-xp", func(w http.ResponseWriter, r *http.Request) {
 		state.Lock()
 		defer state.Unlock()
-		
-		taskIndex := r.FormValue("task")
-		taskIndexInt := 0
-		fmt.Sscanf(taskIndex, "%d", &taskIndexInt)
 
-		// Check if task is already completed
-		if state.Tasks[taskIndexInt].Completed {
-			http.Error(w, "Task already completed", http.StatusBadRequest)
+		taskID := r.FormValue("task")
+		
+		// Start transaction
+		tx, err := state.db.Begin()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		defer tx.Rollback()
 
+		// Get task XP and mark as completed
 		var xp int
-		for i, task := range state.Tasks {
-			if fmt.Sprint(i) == taskIndex {
-				xp = task.XP
-				// Mark task as completed
-				state.Tasks[i].Completed = true
-				break
-			}
+		err = tx.QueryRow("UPDATE tasks SET completed = true WHERE id = $1 AND completed = false RETURNING xp", taskID).Scan(&xp)
+		if err == sql.ErrNoRows {
+			http.Error(w, "Task already completed or not found", http.StatusBadRequest)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		previousLevel := state.TotalXP / 1000
 		state.TotalXP += xp
 		newLevel := state.TotalXP / 1000
 
-		// Check for unlockables when level increases
-		if newLevel > previousLevel {
-			for _, u := range state.Unlockables {
-				if u.Level > previousLevel && u.Level <= newLevel {
-					state.Unlocked[u.Level] = true
-				}
-			}
-		}
-
-		// Save state after modification
-		if err := state.save(); err != nil {
+		// Update total XP
+		_, err = tx.Exec("UPDATE app_state SET total_xp = $1 WHERE id = 1", state.TotalXP)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		currentLevel := newLevel
-		tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
+		// Handle level-ups
+		if newLevel > previousLevel {
+			for level := previousLevel + 1; level <= newLevel; level++ {
+				_, err = tx.Exec("INSERT INTO unlocked_levels (level, unlocked) VALUES ($1, true)", level)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				state.Unlocked[level] = true
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		currentLevel := state.TotalXP / 1000
+		tasks, err := state.getTasks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		unlockables, err := state.getUnlockables()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		err = tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
 			"TotalXP":     state.TotalXP,
 			"CurrentLevel": currentLevel,
-			"Tasks":       state.Tasks,
-			"Unlockables": state.Unlockables,
+			"Tasks":       tasks,
+			"Unlockables": unlockables,
 			"Unlocked":    state.Unlocked,
 			"Progress":    state.GetProgressPercentage(),
 		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 	})
 
 	// Add new endpoint for creating unlockables
@@ -185,81 +416,37 @@ func main() {
 			return
 		}
 
-		newUnlockable := Unlockable{
-			Level:       level,
-			Description: description,
+		_, err := state.db.Exec("INSERT INTO unlockables (level, description) VALUES ($1, $2)", level, description)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
-		state.Unlockables = append(state.Unlockables, newUnlockable)
+		// Replace the comment with actual rendering
+		tasks, err := state.getTasks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		
+		unlockables, err := state.getUnlockables()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		// Check if it should be unlocked based on current level
 		currentLevel := state.TotalXP / 1000
-		if level <= currentLevel {
-			state.Unlocked[level] = true
-		}
-
-		// Save state after modification
-		if err := state.save(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
-			"TotalXP":      state.TotalXP,
+		err = tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{
+			"TotalXP":     state.TotalXP,
 			"CurrentLevel": currentLevel,
-			"Tasks":        state.Tasks,
-			"Unlockables":  state.Unlockables,
-			"Unlocked":     state.Unlocked,
-			"Progress":     state.GetProgressPercentage(),
+			"Tasks":       tasks,
+			"Unlockables": unlockables,
+			"Unlocked":    state.Unlocked,
+			"Progress":    state.GetProgressPercentage(),
 		})
-	})
-
-	// Add new endpoint for creating tasks
-	http.HandleFunc("/add-task", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		state.Lock()
-		defer state.Unlock()
-
-		name := r.FormValue("name")
-		var xp int
-		fmt.Sscanf(r.FormValue("xp"), "%d", &xp)
-
-		if name == "" {
-			http.Error(w, "Task name is required", http.StatusBadRequest)
-			return
-		}
-
-		if xp <= 0 {
-			http.Error(w, "XP must be positive", http.StatusBadRequest)
-			return
-		}
-
-		newTask := Task{
-			Name:      name,
-			XP:        xp,
-			Completed: false,
-		}
-
-		state.Tasks = append(state.Tasks, newTask)
-
-		// Save state after modification
-		if err := state.save(); err != nil {
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
 		}
-
-		tmpl.ExecuteTemplate(w, "app.html", map[string]interface{}{
-			"TotalXP":      state.TotalXP,
-			"CurrentLevel": state.TotalXP / 1000,
-			"Tasks":        state.Tasks,
-			"Unlockables":  state.Unlockables,
-			"Unlocked":     state.Unlocked,
-			"Progress":     state.GetProgressPercentage(),
-		})
 	})
 
 	http.ListenAndServe(":8080", nil)

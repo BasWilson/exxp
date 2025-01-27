@@ -7,7 +7,7 @@
         hx-swap="outerHTML"
         class="flex items-center justify-between pl-3 bg-gray-100 rounded"
     >
-        <input type="hidden" name="task" value="{{ $index }}" />
+        <input type="hidden" name="task" value="{{ $task.ID }}" />
         <span class="text-gray-700">{{ $task.Name }} ({{ $task.XP }} XP)</span>
         <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Complete</button>
     </form>
