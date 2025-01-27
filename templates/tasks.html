@@ -5,12 +5,24 @@
         hx-post="/add-xp"
         hx-target="#app"
         hx-swap="outerHTML"
-        class="flex items-center justify-between pl-3 bg-gray-100 rounded"
+        class="flex items-center justify-between pl-3 bg-gray-100 dark:bg-gray-700 rounded"
     >
         <input type="hidden" name="task" value="{{ $task.ID }}" />
-        <span class="text-gray-700">{{ $task.Name }} ({{ $task.XP }} XP)</span>
+        <span class="text-gray-700 dark:text-gray-200">{{ $task.Name }} ({{ $task.XP }} XP)</span>
         <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Complete</button>
     </form>
     {{ end }} {{ end }}
+
+    <!-- all completed tasks -->
+    <details class="bg-gray-100 dark:bg-gray-700 rounded">
+        <summary class="flex items-center justify-between pl-3 py-2 cursor-pointer">
+            <span class="text-gray-700 dark:text-gray-200">View completed tasks</span>
+        </summary>
+        <div class="pl-3 pb-2 space-y-2">
+            {{ range $index, $task := .Tasks }} {{ if $task.Completed }}
+            <div class="text-gray-700 dark:text-gray-200">{{ $task.Name }} ({{ $task.XP }} XP)</div>
+            {{ end }} {{ end }}
+        </div>
+    </details>
 </div>
 {{ end }}
