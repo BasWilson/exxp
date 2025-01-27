@@ -112,7 +112,7 @@ func init() {
 		"add": func(a, b int) int { return a + b },
 		"sub": func(a, b int) int { return a - b },
 		"mod": func(a, b int) int { return a % b },
-	}).ParseGlob("templates/*.html"))
+	}).ParseFS(templatesFS, "templates/*.html"))
 }
 
 // Initialize database connection
