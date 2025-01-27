@@ -2,9 +2,20 @@
 <body id="app" class="bg-gray-100 dark:bg-gray-900 min-h-screen p-8">
     <div class="max-w-2xl mx-auto">
         <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 mb-6">
-            <h1 class="text-2xl font-bold mb-4 dark:text-white">XP Tracker 📈</h1>
+            <div class="flex justify-between items-center">
+                <h1 class="text-2xl font-bold mb-4 dark:text-white">XP Tracker 📈</h1>
 
-            <div id="progress-section">{{ template "progress.html" . }}</div>
+                <!-- info button about sessions -->
+                <div>
+                    <code
+                        onclick="document.getElementById('session-info').showModal()"
+                        class="bg-gray-100 dark:bg-gray-700 rounded p-2 cursor-pointer dark:text-white"
+                        >{{ .SessionID }}</code
+                    >
+                </div>
+            </div>
+
+            <div id="progress-section" class="mt-6">{{ template "progress.html" . }}</div>
 
             <div class="mt-6">
                 <h2 class="text-xl font-semibold mb-3 dark:text-white">Tasks 📝</h2>
@@ -74,6 +85,29 @@
                     </button>
                 </div>
                 {{ template "add_task.html" . }}
+            </div>
+        </dialog>
+
+        <!-- session info dialog -->
+        <dialog id="session-info" class="rounded-lg shadow-xl dark:shadow-none p-0">
+            <div class="bg-white dark:bg-gray-800 p-6 flex flex-col gap-2">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-semibold dark:text-white">Session Info 📚</h2>
+                    <button
+                        onclick="document.getElementById('session-info').close()"
+                        class="text-gray-500 hover:text-gray-700 dark:text-gray-200"
+                    >
+                        ✕
+                    </button>
+                </div>
+                <p class="text-gray-700 dark:text-white">
+                    Your session ID is:
+                    <code class="bg-gray-100 dark:bg-gray-700 rounded px-2 py-1 dark:text-white"> {{ .SessionID }} </code>
+                </p>
+                <p class="text-gray-700 dark:text-gray-200">
+                    You can choose the ID of the session in the URL, or visit
+                    <a class="text-blue-500 hover:text-blue-600" href="/">home</a> to start a new session.
+                </p>
             </div>
         </dialog>
     </div>

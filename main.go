@@ -25,6 +25,7 @@ type Task struct {
 	Name      string
 	XP        int
 	Completed bool
+	SessionID string
 }
 
 type Unlockable struct {
